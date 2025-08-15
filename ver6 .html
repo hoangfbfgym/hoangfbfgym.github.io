@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Clock – Light, Jitter & MP3 Tick (auto-load)</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #fff; overflow: hidden; -webkit-tap-highlight-color: transparent;
+    }
+    #clockCanvas { display: block; }
+    .controls { display: flex; gap: 0.5em; margin-top: 0.5rem; flex-wrap: wrap; }
+    .controls button {
+      padding: 0.5em 1em; font-size: 1em; background: #ccc; color: #000;
+      border: none; border-radius: 6px; cursor: pointer; transition: filter 0.1s;
+    }
+    .controls button:active { filter: brightness(0.85); }
+  </style>
+</head>
+<body>
+  <canvas id="clockCanvas"></canvas>
+  <div class="controls">
+    <button id="toggleBtn">Toggle</button>
+    <button id="resetBtn">Reset</button>
+    <button id="lightBtn">Light</button>
+    <button id="jitterBtn">Jitter</button>
+    <button id="soundBtn">Sound</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('clockCanvas');
+    const ctx = canvas.getContext('2d');
+    const toggleBtn = document.getElementById('toggleBtn');
+    const resetBtn  = document.getElementById('resetBtn');
+    const lightBtn  = document.getElementById('lightBtn');
+    const jitterBtn = document.getElementById('jitterBtn');
+    const soundBtn  = document.getElementById('soundBtn');
+    const controls  = document.querySelector('.controls');
+
+    let width, height, cx, cy, r;
+    let lastRAFTime = performance.now() / 1000;
+
+    // Theme control
+    let lightMode = true;
+    const themes = {
+      light: { bg: '#fff', mainTicks: ['#000','#555','#777'], text: '#000', hand: '#f00', pivot: '#000' },
+      dark:  { bg: '#000', mainTicks: ['#fff','#555','#333'], text: '#fff', hand: '#f00', pivot: '#fff' }
+    };
+
+    // Jitter (natural) toggle
+    let jitterMode = false;
+
+    function resize() {
+      const dpr = window.devicePixelRatio || 1, ctrlH = controls.offsetHeight;
+      width  = window.innerWidth;
+      height = window.innerHeight - ctrlH;
+      canvas.width  = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width  = width + 'px';
+      canvas.style.height = height + 'px';
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      cx = width / 2; cy = height / 2;
+      r  = Math.min(width, height) * 0.45;
+      document.body.style.background = themes[lightMode ? 'light' : 'dark'].bg;
+    }
+
+    // Timer state
+    let startTime = 0, pausedTime = 0, state = 'paused', resetStart = 0,
+        resetStartElapsed = 0, mainAngleAtReset = 0, subAngleAtReset = 0,
+        resetDuration = 0, flashStart = 0, flashDuration = 0.06;
+
+    toggleBtn.onclick = () => {
+      if (state === 'running') {
+        pausedTime = performance.now() / 1000 - startTime; state = 'paused';
+      } else {
+        startTime = performance.now() / 1000 - pausedTime; state = 'running';
+      }
+    };
+
+    resetBtn.onclick = () => {
+      const now = performance.now() / 1000;
+      resetStartElapsed = (state === 'running') ? now - startTime : pausedTime;
+      flashStart = now;
+      if (resetStartElapsed < 1e-6) return;
+      mainAngleAtReset = (resetStartElapsed % 48) * (360/48);
+      subAngleAtReset  = (resetStartElapsed % 1) * 360;
+      resetDuration    = mainAngleAtReset / 360;
+      resetStart       = now; state = 'resetting';
+
+      initPhys(physMain, 360/48);
+      initPhys(physSub,  360/10);
+    };
+
+    lightBtn.onclick = () => {
+      lightMode = !lightMode;
+      document.body.style.background = themes[lightMode ? 'light' : 'dark'].bg;
+    };
+
+    jitterBtn.onclick = () => {
+      jitterMode = !jitterMode;
+      // sync physics to current smooth angles to avoid a jump when toggling on
+      const now = performance.now()/1000;
+      const elapsed = (state==='running') ? now - startTime : (state==='paused' ? pausedTime : 0);
+      const mainSmooth = (elapsed%48)/48*360;
+      const subSmooth  = (elapsed%1)*360;
+      initPhys(physMain, 360/48, mainSmooth);
+      initPhys(physSub,  360/10, subSmooth);
+    };
+
+    // ---------- Natural Jitter Model (unwrapped angles) ----------
+    function makePhys(params) {
+      return {
+        dispDeg: 0, vel: 0,
+        lastIndex: -1, turns: 0, targetDeg: 0,
+        stepDeg: params.stepDeg,
+        k: params.k, c: params.c, kick: params.kick,
+        noiseTau: params.noiseTau, noiseAmp: params.noiseAmp, noise: 0
+      };
+    }
+    function initPhys(phys, stepDeg, currentDeg = 0) {
+      phys.stepDeg = stepDeg;
+      phys.dispDeg = currentDeg;
+      phys.vel = 0;
+      phys.noise = 0;
+      phys.turns = 0;
+      phys.lastIndex = -1;
+      phys.targetDeg = currentDeg;
+    }
+    const physMain = makePhys({ stepDeg: 360/48, k: 120, c: 18,  kick: 140, noiseTau: 0.7, noiseAmp: 0.6 });
+    const physSub  = makePhys({ stepDeg: 360/10, k: 140, c: 20,  kick:  80, noiseTau: 0.5, noiseAmp: 0.45 });
+
+    function stepPhys(phys, dt) {
+      const decay = Math.exp(-dt / phys.noiseTau);
+      const sigma = Math.sqrt(1 - decay * decay);
+      phys.noise = phys.noise * decay + sigma * phys.noiseAmp * (Math.random()*2 - 1);
+      const dx = phys.dispDeg - phys.targetDeg;
+      const acc = -phys.k * dx - phys.c * phys.vel + phys.noise;
+      phys.vel += acc * dt;
+      phys.dispDeg += phys.vel * dt;
+      phys.dispDeg += 0.02 * (Math.random()*2 - 1);
+    }
+    function mod360(d) { d %= 360; if (d < 0) d += 360; return d; }
+
+    // ---------- SOUND (auto-load hoangtick.mp3) ----------
+    let audioCtx = null, isSoundOn = false, lastTickIndexForSound = -1, tikTokFlip = 0;
+    let tickBufferA = null, tickBufferB = null;
+    let tickLoaded = false, tickLoading = false;
+
+    soundBtn.onclick = async () => {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // iOS/Chrome policy: resume after user gesture
+      if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
+
+      // Lazy-load the MP3 the first time Sound is pressed
+      if (!tickLoaded && !tickLoading) {
+        tickLoading = true;
+        try {
+          const arrBuf = await fetch('hoangtick.mp3', { cache: 'reload' }).then(r => {
+            if (!r.ok) throw new Error('hoangtick.mp3 not found next to HTML');
+            return r.arrayBuffer();
+          });
+          const decoded = await audioCtx.decodeAudioData(arrBuf.slice(0));
+          const { a, b } = extractTickPairs(decoded);
+          tickBufferA = a; tickBufferB = b || a;
+          tickLoaded = true;
+          soundBtn.textContent = 'Sound (Loaded)';
+        } catch (e) {
+          console.warn(e);
+          alert('Could not load hoangtick.mp3. Make sure it is in the same folder as this HTML.');
+        } finally {
+          tickLoading = false;
+        }
+      }
+
+      isSoundOn = !isSoundOn;
+      soundBtn.style.background = isSoundOn ? '#9fe29f' : '#ccc';
+      if (!tickLoaded) soundBtn.textContent = isSoundOn ? 'Sound (Loading...)' : 'Sound';
+    };
+
+    // Detect two loud transients; slice ~55 ms around each
+    function extractTickPairs(decoded) {
+      const sr = decoded.sampleRate;
+      const chs = decoded.numberOfChannels;
+      const len = decoded.length;
+
+      const analyzeFrames = Math.min(len, Math.floor(sr * 6));
+      const mono = new Float32Array(analyzeFrames);
+      for (let ch = 0; ch < chs; ch++) {
+        const data = decoded.getChannelData(ch);
+        for (let i = 0; i < analyzeFrames; i++) mono[i] += data[i] / chs;
+      }
+
+      let maxAbs = 1e-9;
+      for (let i = 0; i < analyzeFrames; i++) {
+        const v = Math.abs(mono[i]);
+        if (v > maxAbs) maxAbs = v;
+      }
+      const thresh = maxAbs * 0.45;
+      const minSep = Math.floor(sr * 0.18);
+      const peaks = [];
+      let i = 1, lastPeak = -minSep;
+      while (i < analyzeFrames - 1 && peaks.length < 8) {
+        if (i - lastPeak < minSep) { i++; continue; }
+        const v = Math.abs(mono[i]);
+        if (v > thresh && v >= Math.abs(mono[i-1]) && v >= Math.abs(mono[i+1])) {
+          peaks.push(i);
+          lastPeak = i;
+          i += minSep;
+        } else {
+          i++;
+        }
+      }
+      if (peaks.length === 0) peaks.push(Math.floor(sr * 0.25));
+      const pA = peaks[0];
+      const pB = peaks[1] ?? peaks[0];
+
+      const pre = Math.floor(sr * 0.005);
+      const dur = Math.floor(sr * 0.055);
+      const aStart = Math.max(0, pA - pre), bStart = Math.max(0, pB - pre);
+      const aLen = Math.min(dur, decoded.length - aStart);
+      const bLen = Math.min(dur, decoded.length - bStart);
+
+      const aBuf = audioCtx.createBuffer(1, aLen, sr);
+      const bBuf = audioCtx.createBuffer(1, bLen, sr);
+      const aArr = aBuf.getChannelData(0);
+      const bArr = bBuf.getChannelData(0);
+
+      for (let k = 0; k < aLen; k++) {
+        let x = mono[aStart + k] || 0;
+        const fadeIn  = Math.min(1, k / (sr * 0.002));
+        const fadeOut = Math.min(1, (aLen - 1 - k) / (sr * 0.004));
+        aArr[k] = x * Math.min(fadeIn, fadeOut);
+      }
+      for (let k = 0; k < bLen; k++) {
+        let x = mono[bStart + k] || 0;
+        const fadeIn  = Math.min(1, k / (sr * 0.002));
+        const fadeOut = Math.min(1, (bLen - 1 - k) / (sr * 0.004));
+        bArr[k] = x * Math.min(fadeIn, fadeOut);
+      }
+      return { a: aBuf, b: bBuf };
+    }
+
+    function playTick() {
+      if (!audioCtx || !isSoundOn || !tickBufferA || !tickLoaded) return;
+      const now = audioCtx.currentTime;
+      const src  = audioCtx.createBufferSource();
+      const gain = audioCtx.createGain();
+      src.buffer = (tikTokFlip ^= 1) ? tickBufferA : tickBufferB;
+      gain.gain.setValueAtTime(0.85, now);
+      src.connect(gain);
+      gain.connect(audioCtx.destination);
+      src.start(now);
+    }
+
+    function maybePlayTick(currentMainIdx) {
+      if (!isSoundOn || !tickBufferA || !tickLoaded) return;
+      if (currentMainIdx !== lastTickIndexForSound) {
+        lastTickIndexForSound = currentMainIdx;
+        playTick();
+      }
+    }
+
+    // ----------------- DRAW / ANIMATE -----------------
+    function draw(elapsed, dt) {
+      const t = themes[lightMode ? 'light' : 'dark'];
+      ctx.clearRect(0, 0, width, height);
+
+      // Ticks
+      for (let i=0;i<192;i++){
+        const ang=(i/192)*2*Math.PI-Math.PI/2;
+        let len, col, lw;
+        if(i%16===0){len=r*0.10*1.2; col=t.mainTicks[0]; lw=r*0.02;} 
+        else if(i%4===0){len=r*0.06*1.2; col=t.mainTicks[1]; lw=r*0.015;} 
+        else {len=r*0.03*1.2; col=t.mainTicks[2]; lw=r*0.016;}
+        const x1=cx+Math.cos(ang)*(r-len), y1=cy+Math.sin(ang)*(r-len),
+              x2=cx+Math.cos(ang)*r,       y2=cy+Math.sin(ang)*r;
+        ctx.beginPath(); ctx.lineCap='butt'; ctx.strokeStyle=col; ctx.lineWidth=lw;
+        ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      }
+
+      // Labels
+      ctx.fillStyle=t.text; ctx.font='bold '+(r*0.16)+'px sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      for(let j=0;j<12;j++){
+        const ang=(j/12)*2*Math.PI-Math.PI/2, txt=(j===0?'48':(j*4).toString());
+        ctx.fillText(txt, cx+Math.cos(ang)*r*0.75, cy+Math.sin(ang)*r*0.75);
+      }
+
+      // Digital
+      const now=performance.now()/1000;
+      ctx.fillStyle=(now-flashStart<flashDuration)?t.hand:t.text;
+      ctx.font='bold '+(r*0.10)+'px sans-serif';
+      const mins=String(Math.floor(elapsed/60)).padStart(2,'0'),
+            secs=String(Math.floor(elapsed%60)).padStart(2,'0'),
+            cs  =String(Math.floor((elapsed%1)*100)).padStart(2,'0');
+      ctx.fillText(`${mins}:${secs}.${cs}`, cx, cy+r*0.4);
+
+      // Base smooth angles for non-jitter mode
+      const mainSmooth = (elapsed%48)/48*360;
+      const subSmooth  = (elapsed%1)*360;
+
+      // Indices for step targets
+      const mainIdx = Math.floor(elapsed % 48);
+      const subIdx  = Math.floor((elapsed % 1) * 10);
+
+      // Attempt tick sound exactly on new main second
+      if (state === 'running') maybePlayTick(mainIdx);
+
+      if (state === 'running') {
+        if (!jitterMode) {
+          // Smooth mode
+          physMain.dispDeg = mainSmooth; physMain.vel = 0; physMain.lastIndex = mainIdx; physMain.turns = 0; physMain.targetDeg = mainSmooth;
+          physSub.dispDeg  = subSmooth;  physSub.vel  = 0; physSub.lastIndex  = subIdx;  physSub.turns  = 0; physSub.targetDeg  = subSmooth;
+        } else {
+          // MAIN (1 step/sec, 48 steps per revolution)
+          if (physMain.lastIndex === -1) physMain.lastIndex = mainIdx;
+          if (mainIdx < physMain.lastIndex) physMain.turns += 1;
+          const newMainTarget = physMain.turns * 360 + mainIdx * physMain.stepDeg;
+          const mainTickChanged = (mainIdx !== physMain.lastIndex);
+          if (mainTickChanged) {
+            const dir = Math.sign(newMainTarget - physMain.dispDeg) || 1;
+            physMain.vel += physMain.kick * dir;
+          }
+          physMain.targetDeg = newMainTarget;
+          stepPhys(physMain, dt);
+          physMain.lastIndex = mainIdx;
+
+          // SUB (tenths; 10 steps per sub revolution)
+          if (physSub.lastIndex === -1) physSub.lastIndex = subIdx;
+          if (subIdx < physSub.lastIndex) physSub.turns += 1;
+          const newSubTarget = physSub.turns * 360 + subIdx * physSub.stepDeg;
+          const subTickChanged = (subIdx !== physSub.lastIndex);
+          if (subTickChanged) {
+            const dirS = Math.sign(newSubTarget - physSub.dispDeg) || 1;
+            physSub.vel += physSub.kick * dirS;
+          }
+          physSub.targetDeg = newSubTarget;
+          stepPhys(physSub, dt);
+          physSub.lastIndex = subIdx;
+        }
+      } else if (state === 'paused') {
+        physMain.dispDeg = mainSmooth; physMain.vel = 0; physMain.lastIndex = Math.floor(pausedTime%48); physMain.turns = 0; physMain.targetDeg = mainSmooth;
+        physSub.dispDeg  = subSmooth;  physSub.vel  = 0; physSub.lastIndex  = Math.floor((pausedTime%1)*10); physSub.turns = 0; physSub.targetDeg = subSmooth;
+      } else {
+        const d=now-resetStart;
+        const mainDeg=mainAngleAtReset - d*360;
+        const subDeg =subAngleAtReset  - d*360;
+        if(d>=resetDuration){state='paused'; pausedTime=0;}
+        physMain.dispDeg = mainDeg; physMain.vel = 0; physMain.lastIndex = -1; physMain.turns = 0; physMain.targetDeg = mainDeg;
+        physSub.dispDeg  = subDeg;  physSub.vel  = 0; physSub.lastIndex  = -1; physSub.turns  = 0; physSub.targetDeg = subDeg;
+      }
+
+      // Sub-dial rim
+      const sr=r*0.15, sx=cx+r*0.5-sr, sy=cy-r*0.3;
+      ctx.beginPath(); ctx.strokeStyle=t.text; ctx.lineWidth=sr*0.02;
+      ctx.arc(sx,sy,sr,0,2*Math.PI); ctx.stroke();
+
+      // Sub ticks & nums
+      ctx.fillStyle=t.text; ctx.font='bold '+(r*0.08*0.8)+'px sans-serif';
+      for(let k=0;k<10;k++){
+        const a=(k/10)*2*Math.PI-Math.PI/2;
+        const x1=sx+Math.cos(a)*sr*0.9, y1=sy+Math.sin(a)*sr*0.9,
+              x2=sx+Math.cos(a)*sr,     y2=sy+Math.sin(a)*sr;
+        ctx.beginPath(); ctx.lineCap='butt'; ctx.strokeStyle=t.text; ctx.lineWidth=r*0.01;
+        ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+        ctx.fillText(k.toString(), sx+Math.cos(a)*sr*0.7, sy+Math.sin(a)*sr*0.7);
+      }
+
+      // Sub hand (draw wrapped)
+      const subDrawDeg = mod360(physSub.dispDeg);
+      const subRad=subDrawDeg*Math.PI/180-Math.PI/2;
+      ctx.beginPath(); ctx.strokeStyle=t.hand; ctx.lineWidth=r*0.015; ctx.lineCap='round';
+      ctx.moveTo(sx-Math.cos(subRad)*sr*0.3, sy-Math.sin(subRad)*sr*0.3);
+      ctx.lineTo(sx+Math.cos(subRad)*sr*0.9, sy+Math.sin(subRad)*sr*0.9);
+      ctx.stroke();
+
+      // Sub center
+      ctx.beginPath(); ctx.fillStyle=t.pivot; ctx.arc(sx,sy,r*0.015,0,2*Math.PI); ctx.fill();
+
+      // Main hand (draw wrapped)
+      const mainDrawDeg = mod360(physMain.dispDeg);
+      const mRad=mainDrawDeg*Math.PI/180-Math.PI/2;
+      ctx.beginPath(); ctx.strokeStyle=t.hand; ctx.lineWidth=r*0.02; ctx.lineCap='butt';
+      ctx.moveTo(cx-Math.cos(mRad)*r*0.15, cy-Math.sin(mRad)*r*0.15);
+      ctx.lineTo(cx+Math.cos(mRad)*r, cy+Math.sin(mRad)*r);
+      ctx.stroke();
+
+      // Pivot
+      ctx.beginPath(); ctx.arc(cx,cy,r*0.04,0,2*Math.PI);
+      ctx.strokeStyle=t.pivot; ctx.lineWidth=r*0.01; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,r*0.018,0,2*Math.PI);
+      ctx.fillStyle=t.pivot; ctx.fill();
+    }
+
+    function animate() {
+      const now = performance.now()/1000;
+      let elapsed;
+      if(state==='running') elapsed = now - startTime;
+      else if(state==='paused') elapsed = pausedTime;
+      else { const d=now-resetStart; elapsed= Math.max(0, resetStartElapsed*(1-d/resetDuration)); }
+
+      let dt = now - lastRAFTime; if (dt > 0.1) dt = 0.1;
+      lastRAFTime = now;
+
+      draw(elapsed, dt);
+      requestAnimationFrame(animate);
+    }
+
+    window.addEventListener('resize', resize);
+    resize(); animate();
+  </script>
+</body>
+</html>
