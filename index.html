@@ -2,25 +2,62 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Clock – Light, Jitter & MP3 Tick (auto-load)</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
+  <title>Clock – Mobile-Safe, Jitter & Tick</title>
   <style>
     html, body {
-      margin: 0; padding: 0; width: 100%; height: 100vh;
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      background: #fff; overflow: hidden; -webkit-tap-highlight-color: transparent;
+      margin: 0; padding: 0;
+      height: 100dvh; /* dynamic viewport height (mobile-safe) */
+      background: #fff;
+      -webkit-text-size-adjust: 100%;
+      touch-action: manipulation;
     }
-    #clockCanvas { display: block; }
-    .controls { display: flex; gap: 0.5em; margin-top: 0.5rem; flex-wrap: wrap; }
+    body {
+      overflow: hidden;
+    }
+    #clockCanvas {
+      display: block;
+      width: 100vw;
+      height: 100dvh; /* canvas fills screen; controls overlay on top */
+    }
+    /* Controls pinned above iOS safe area */
+    .controls {
+      position: fixed;
+      left: 0; right: 0;
+      bottom: env(safe-area-inset-bottom);
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding:
+        0.5rem
+        calc(env(safe-area-inset-right) + 8px)
+        calc(env(safe-area-inset-bottom) + 8px)
+        calc(env(safe-area-inset-left) + 8px);
+      z-index: 10;
+      background: rgba(255,255,255,0.65);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
     .controls button {
-      padding: 0.5em 1em; font-size: 1em; background: #ccc; color: #000;
-      border: none; border-radius: 6px; cursor: pointer; transition: filter 0.1s;
+      padding: 0.6em 1em;
+      font-size: 1rem;
+      background: #ccc;
+      color: #000;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: filter 0.1s;
     }
     .controls button:active { filter: brightness(0.85); }
   </style>
 </head>
 <body>
   <canvas id="clockCanvas"></canvas>
+
   <div class="controls">
     <button id="toggleBtn">Toggle</button>
     <button id="resetBtn">Reset</button>
@@ -37,7 +74,6 @@
     const lightBtn  = document.getElementById('lightBtn');
     const jitterBtn = document.getElementById('jitterBtn');
     const soundBtn  = document.getElementById('soundBtn');
-    const controls  = document.querySelector('.controls');
 
     let width, height, cx, cy, r;
     let lastRAFTime = performance.now() / 1000;
@@ -53,19 +89,27 @@
     let jitterMode = false;
 
     function resize() {
-      const dpr = window.devicePixelRatio || 1, ctrlH = controls.offsetHeight;
-      width  = window.innerWidth;
-      height = window.innerHeight - ctrlH;
-      canvas.width  = width * dpr;
-      canvas.height = height * dpr;
-      canvas.style.width  = width + 'px';
-      canvas.style.height = height + 'px';
+      const dpr = window.devicePixelRatio || 1;
+      const vp = window.visualViewport;
+      const w = vp ? vp.width  : window.innerWidth;
+      const h = vp ? vp.height : window.innerHeight;
+
+      canvas.width  = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.width  = w + 'px';
+      canvas.style.height = h + 'px';
+
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.scale(dpr, dpr);
+
+      width = w; height = h;
       cx = width / 2; cy = height / 2;
       r  = Math.min(width, height) * 0.45;
+
       document.body.style.background = themes[lightMode ? 'light' : 'dark'].bg;
     }
+    window.addEventListener('resize', resize);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
 
     // Timer state
     let startTime = 0, pausedTime = 0, state = 'paused', resetStart = 0,
@@ -144,18 +188,15 @@
     }
     function mod360(d) { d %= 360; if (d < 0) d += 360; return d; }
 
-    // ---------- SOUND (auto-load hoangtick.mp3) ----------
+    // ---------- SOUND (auto-load hoangtick.mp3 on first Sound tap) ----------
     let audioCtx = null, isSoundOn = false, lastTickIndexForSound = -1, tikTokFlip = 0;
     let tickBufferA = null, tickBufferB = null;
     let tickLoaded = false, tickLoading = false;
 
     soundBtn.onclick = async () => {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-      // iOS/Chrome policy: resume after user gesture
       if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
 
-      // Lazy-load the MP3 the first time Sound is pressed
       if (!tickLoaded && !tickLoading) {
         tickLoading = true;
         try {
@@ -170,7 +211,11 @@
           soundBtn.textContent = 'Sound (Loaded)';
         } catch (e) {
           console.warn(e);
-          alert('Could not load hoangtick.mp3. Make sure it is in the same folder as this HTML.');
+          const usingFile = location.protocol === 'file:';
+          const msg = usingFile
+            ? 'This page is opened via file:// so fetch() is blocked.\nStart a local server (e.g. python -m http.server) or host online.'
+            : 'Could not load hoangtick.mp3. Ensure it is in the same folder and the filename matches exactly.';
+          alert(msg);
         } finally {
           tickLoading = false;
         }
@@ -403,15 +448,15 @@
       else if(state==='paused') elapsed = pausedTime;
       else { const d=now-resetStart; elapsed= Math.max(0, resetStartElapsed*(1-d/resetDuration)); }
 
-      let dt = now - lastRAFTime; if (dt > 0.1) dt = 0.1;
+      let dt = now - lastRAFTime; if (dt > 0.1) dt = 0.1; // stability on background/tab switch
       lastRAFTime = now;
 
       draw(elapsed, dt);
       requestAnimationFrame(animate);
     }
 
-    window.addEventListener('resize', resize);
-    resize(); animate();
+    resize();
+    animate();
   </script>
 </body>
 </html>
